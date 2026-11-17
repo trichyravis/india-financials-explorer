@@ -441,13 +441,29 @@ else:
     if not mcap and price:  # market cap = price × diluted shares
         _sh = col(I, "weightedAverageShsOutDil").dropna()
         mcap = price * float(_sh.iloc[-1]) if len(_sh) else None
-    beta = p.get("beta")
+    beta = p.get("beta")  # Yahoo's published beta (method not disclosed; for Indian stocks it is not measured against the Nifty)
+
+    def quick_beta(stock, market, years=5):
+        """5-year monthly regression beta: Cov(Rs, Rm) / Var(Rm)."""
+        a_, b2_ = price_history(stock, key), price_history(market, key)
+        if a_ is None or b2_ is None:
+            return None
+        cut_ = pd.Timestamp(dt.date.today().replace(year=dt.date.today().year - years))
+        d_ = pd.DataFrame({"s": a_[a_.index >= cut_].resample("ME").last(),
+                           "m": b2_[b2_.index >= cut_].resample("ME").last()}).dropna().pct_change().dropna()
+        if len(d_) < 12:
+            return None
+        c2_ = np.cov(d_["s"], d_["m"], ddof=1)
+        return c2_[0, 1] / c2_[1, 1]
+
+    nifty_beta = quick_beta(sym, "^NSEI")
     st.html(card(t(p.get("companyName", sym), TXT, 26, 800) + "&nbsp;&nbsp;" +
                  t(f"{sym} · {p.get('exchange', p.get('exchangeFullName', ''))} · {p.get('sector', '')} · {p.get('industry', '')}", LB, 14),
                  pad="16px 22px"))
     kp = [("Price", f"₹{price:,.2f}" if price else "–",
            (t(f"{chg:+.2f}% today", GRN if (chg or 0) >= 0 else RED, 13, 700) if chg is not None else "")),
-          ("Market cap", money(mcap, cur), ""), ("Beta", f"{beta:.2f}" if beta else "–", t("vs market", MUTED, 12)),
+          ("Market cap", money(mcap, cur), ""), ("Beta vs Nifty 50", f"{nifty_beta:.2f}" if nifty_beta is not None else (f"{beta:.2f}" if beta else "–"),
+           t("5-yr monthly regression" if nifty_beta is not None else "Yahoo figure", MUTED, 12)),
           ("Latest revenue", money(rev.iloc[-1], cur), t(I.index[-1], MUTED, 12)),
           ("Latest net income", money(ni.iloc[-1], cur), t(pct(R['Net margin'].iloc[-1]) + " margin", MUTED, 12))]
     cols = st.columns(len(kp))
@@ -561,7 +577,7 @@ else:
                 k_ = 12 if freq == "Monthly" else 52
                 vol_s, vol_m = rr["Stock return"].std() * np.sqrt(k_), rr["Market return"].std() * np.sqrt(k_)
                 cc = st.columns(5)
-                for c_, (h, v_) in zip(cc, [("Regression beta", f"{reg_beta:.2f}"), ("Yahoo beta", f"{beta:.2f}" if beta else "–"),
+                for c_, (h, v_) in zip(cc, [("Regression beta", f"{reg_beta:.2f}"), ("Yahoo beta (not vs Nifty)", f"{beta:.2f}" if beta else "–"),
                                            ("R²", f"{r2:.2f}"), ("Stock volatility (ann.)", pct(vol_s)),
                                            ("Market volatility (ann.)", pct(vol_m))]):
                     c_.html(card(t(h.upper(), GOLD, 11, 800, "letter-spacing:1px") + "<br>" + t(v_, TXT, 22, 800)))
@@ -574,12 +590,33 @@ else:
                               line=dict(color=GOLD, width=3))
                 f.update_xaxes(title="Market return %", type="linear"); f.update_yaxes(title="Stock return %")
                 a.plotly_chart(f, width="stretch")
-                f = fig_base("Growth of $100")
+                f = fig_base("Growth of ₹100")
                 f.update_xaxes(type="date")
                 f.add_scatter(x=RET.index, y=RET["Stock price"] / RET["Stock price"].iloc[0] * 100, name=sym, line=dict(color=GOLD, width=3))
                 f.add_scatter(x=RET.index, y=RET["Nifty 50"] / RET["Nifty 50"].iloc[0] * 100, name="Nifty 50", line=dict(color=LB, width=3))
                 b.plotly_chart(f, width="stretch")
                 st.caption(f"β = Cov(Rs, Rm) ÷ Var(Rm) on {len(rr)} {freq.lower()} returns. In Excel: =SLOPE(stock returns, market returns).")
+                sp_beta = quick_beta(sym, "^GSPC")
+                with st.expander("📘 Why is Yahoo's beta so different from the regression beta?"):
+                    st.html(card(
+                        t("Beta depends on four choices", GOLD, 16, 800) + "<br>" +
+                        t("β = Cov(R<sub>stock</sub>, R<sub>market</sub>) ÷ Var(R<sub>market</sub>) — the slope of the stock's returns "
+                          "on the market's. Change any of these and beta changes:", TXT, 15) + "<br><br>" +
+                        t("1. <b>Which market index</b> — the biggest effect. A CAPM cost of equity for an Indian company needs beta "
+                          "against an Indian market index (Nifty 50 or Sensex), because the market risk premium you use is India's.<br>"
+                          "2. <b>Return frequency</b> — daily, weekly or monthly.<br>"
+                          "3. <b>Length of history</b> — 2, 3 or 5 years.<br>"
+                          "4. <b>Price data</b> — adjusted for dividends and splits or not.", TXT, 14) + "<br><br>" +
+                        t(f"For {sym}, 5-year monthly returns give:", GOLD, 15, 700) + "<br>" +
+                        t(f"• against Nifty 50: <b>{nifty_beta:.2f}</b>" if nifty_beta is not None else "• against Nifty 50: –", TXT, 15) + "<br>" +
+                        t(f"• against the US S&P 500: <b>{sp_beta:.2f}</b>" if sp_beta is not None else "• against the US S&P 500: –", TXT, 15) + "<br>" +
+                        t(f"• Yahoo's published figure: <b>{beta:.2f}</b>" if beta else "• Yahoo's published figure: –", TXT, 15) + "<br><br>" +
+                        t("Yahoo labels its beta '5Y monthly' but does not publish the method, and for Indian stocks its figure usually "
+                          "matches neither Indian-market regression. Treat it as a rough reference only. Use the <b>regression beta "
+                          "against the Nifty 50</b> (computed here, and reproducible in Excel with =SLOPE on the Beta sheet) for CAPM "
+                          "and WACC.", TXT, 14) + "<br><br>" +
+                        t("Optional refinement: many analysts use the Blume-adjusted beta = 0.67 × raw beta + 0.33 × 1, "
+                          "which pulls estimates towards 1 because betas tend to drift towards the market average over time.", MUTED, 13)))
             else:
                 st.warning("Not enough price history to estimate beta.")
 
@@ -639,8 +676,9 @@ else:
             st.warning("Market value of equity is not available right now, so the WACC below is not meaningful. Retry in a minute.")
         d_val = float(debt.iloc[-1]) if pd.notna(debt.iloc[-1]) else 0.0
         kd_pre = float(intexp.iloc[-1] / d_val) if d_val and pd.notna(intexp.iloc[-1]) and intexp.iloc[-1] > 0 else 0.0
-        opts = ["Yahoo beta"] + (["Regression beta"] if reg_beta is not None else []) + ["Manual"]
-        src = st.radio("Beta to use", opts, horizontal=True, index=1 if reg_beta is not None else 0)
+        opts = (["Regression beta"] if reg_beta is not None else []) + ["Yahoo beta", "Manual"]
+        src = st.radio("Beta to use", opts, horizontal=True, index=0,
+                       help="Regression beta = slope of the stock's returns on the Nifty 50 (Beta tab). Yahoo's figure is not measured against the Nifty.")
         dflt = float(reg_beta) if src == "Regression beta" else float(beta or 1.0)
         b_ = st.number_input("Beta", 0.0, 4.0, round(dflt, 2), 0.01, key=f"beta_{src}", disabled=(src != "Manual"))
         kd_in = st.number_input("Pre-tax cost of debt (default = interest ÷ debt)", 0.0, 0.3, round(kd_pre, 4), 0.001, format="%.4f")
