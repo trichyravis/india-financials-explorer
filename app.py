@@ -144,25 +144,66 @@ def _rows(df, mapping, quarterly):
     return sorted(out, key=lambda r: r["date"], reverse=True)
 
 
+def _retry(fn, tries=3):
+    """Yahoo often answers cloud servers with an empty reply or a 429: retry with a short back-off."""
+    import time
+    last = None
+    for i_ in range(tries):
+        try:
+            out = fn()
+            empty_ = (out is None) or (hasattr(out, "empty") and out.empty) or (isinstance(out, (dict, list)) and len(out) == 0)
+            if not empty_:
+                return out
+        except Exception as e:  # noqa: BLE001
+            last = e
+        time.sleep(1.5 * (i_ + 1))
+    if last:
+        raise last
+    return None
+
+
+def _info(tk):
+    """Company info, falling back to fast_info when Yahoo blocks the full quoteSummary call."""
+    try:
+        info = _retry(lambda: tk.info, 2) or {}
+    except Exception:
+        info = {}
+    if not info.get("marketCap") or not (info.get("currentPrice") or info.get("regularMarketPrice")):
+        try:
+            fi = tk.fast_info
+            info.setdefault("regularMarketPrice", fi.get("lastPrice"))
+            info.setdefault("marketCap", fi.get("marketCap"))
+            info.setdefault("currency", fi.get("currency"))
+            if info.get("marketCap") is None:
+                info["marketCap"] = fi.get("marketCap")
+            if info.get("regularMarketPrice") is None:
+                info["regularMarketPrice"] = fi.get("lastPrice")
+        except Exception:
+            pass
+    return info
+
+
 @st.cache_data(ttl=6 * 3600, show_spinner=False)
 def fmp(endpoint, symbol, key=None, period="annual", limit=5, extra=None):
-    """Same call shape as the US app, answered from Yahoo Finance."""
+    """Same call shape as the US app, answered from Yahoo Finance.
+    Empty replies raise (so they are NOT cached) instead of returning []."""
     try:
         tk = yf.Ticker(symbol)
         q = period == "quarter"
-        if endpoint == "income-statement":
-            return _rows(tk.quarterly_income_stmt if q else tk.income_stmt, IS_MAP, q)[:limit]
-        if endpoint == "balance-sheet-statement":
-            return _rows(tk.quarterly_balance_sheet if q else tk.balance_sheet, BS_MAP, q)[:limit]
-        if endpoint == "cash-flow-statement":
-            return _rows(tk.quarterly_cashflow if q else tk.cashflow, CF_MAP, q)[:limit]
-        info = tk.info or {}
+        stmts = {"income-statement": (lambda: tk.quarterly_income_stmt if q else tk.income_stmt, IS_MAP),
+                 "balance-sheet-statement": (lambda: tk.quarterly_balance_sheet if q else tk.balance_sheet, BS_MAP),
+                 "cash-flow-statement": (lambda: tk.quarterly_cashflow if q else tk.cashflow, CF_MAP)}
+        if endpoint in stmts:
+            getter, mp = stmts[endpoint]
+            rows = _rows(_retry(getter), mp, q)[:limit]
+            if not rows:
+                raise FMPError(f"Yahoo Finance returned no {endpoint.replace('-', ' ')} for {symbol}.")
+            return rows
+        info = _info(tk)
         if endpoint == "profile":
-            if not info.get("longName") and not info.get("shortName"):
-                return []
             lo, hi = info.get("fiftyTwoWeekLow"), info.get("fiftyTwoWeekHigh")
-            return [{"symbol": symbol, "companyName": info.get("longName") or info.get("shortName"),
-                     "currency": info.get("currency", "INR"), "exchange": {"NSI": "NSE", "BSE": "BSE"}.get(info.get("exchange"), info.get("exchange", "")),
+            return [{"symbol": symbol, "companyName": info.get("longName") or info.get("shortName") or symbol,
+                     "currency": info.get("currency") or "INR", "exchange": {"NSI": "NSE", "BSE": "BSE"}.get(info.get("exchange"), info.get("exchange") or ("NSE" if symbol.endswith(".NS") else "BSE")),
                      "sector": info.get("sector", ""), "industry": info.get("industry", ""), "beta": info.get("beta"),
                      "marketCap": info.get("marketCap"), "price": info.get("currentPrice") or info.get("regularMarketPrice"),
                      "description": info.get("longBusinessSummary", "–"), "fullTimeEmployees": info.get("fullTimeEmployees"),
@@ -180,11 +221,13 @@ def fmp(endpoint, symbol, key=None, period="annual", limit=5, extra=None):
                      "enterpriseValueMultipleTTM": info.get("enterpriseToEbitda"),
                      "dividendYieldTTM": info.get("trailingAnnualDividendYield"), "name": info.get("longName") or info.get("shortName")}]
         return []
+    except FMPError:
+        raise
     except Exception as e:
         msg = str(e)
         if "Too Many Requests" in msg or "429" in msg or "Rate" in msg:
-            raise FMPError("Yahoo Finance is limiting requests right now. Wait a minute and click Fetch data again.")
-        raise FMPError(f"Could not load {endpoint} for {symbol}: {msg[:120]}")
+            raise FMPError("Yahoo Finance is limiting requests from this server right now. Wait a minute, then click Fetch data again.")
+        raise FMPError(f"Could not load {endpoint} for {symbol}: {msg[:160]}")
 
 
 def calls_today(key):
@@ -194,10 +237,9 @@ def calls_today(key):
 @st.cache_data(ttl=24 * 3600, show_spinner=False)
 def search_company(query, key=None):
     """Company name search on Yahoo Finance; NSE first, then BSE."""
-    try:
-        quotes = yf.Search(query, max_results=15).quotes
-    except Exception:
-        return []
+    quotes = _retry(lambda: yf.Search(query, max_results=15).quotes, 2) or []
+    if not quotes:
+        raise FMPError("Search unavailable right now.")  # not cached
     out = []
     for d in quotes:
         sym_ = d.get("symbol", "")
@@ -234,14 +276,21 @@ def latest_10y(key=None):
     return None, None
 
 
-@st.cache_data(ttl=6 * 3600, show_spinner=False)
 def price_history(symbol, key=None, years=5):
     try:
-        h = yf.Ticker(symbol).history(period=f"{years}y", interval="1d", auto_adjust=True)
-    except Exception:
+        return _price_history(symbol, key, years)
+    except FMPError:
         return None
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def _price_history(symbol, key=None, years=5):
+    try:
+        h = _retry(lambda: yf.Ticker(symbol).history(period=f"{years}y", interval="1d", auto_adjust=True))
+    except Exception as e:
+        raise FMPError(f"No price history for {symbol}: {str(e)[:100]}")
     if h is None or h.empty:
-        return None
+        raise FMPError(f"No price history for {symbol}.")
     sr = h["Close"].astype(float)
     sr.index = pd.to_datetime(sr.index).tz_localize(None)
     return sr
@@ -266,7 +315,7 @@ with st.sidebar:
     if q.strip() and key:
         try:
             hits = search_company(q.strip(), key)
-        except FMPError as e:
+        except Exception as e:
             hits = []
             st.error(str(e))
         if hits:
@@ -326,8 +375,10 @@ else:
             cfs = fmp("cash-flow-statement", sym, key, per, lim)
     except FMPError as e:
         st.error(str(e))
+        st.caption("Yahoo Finance sometimes limits shared cloud servers. Nothing is stored when a request fails, "
+                   "so clicking Fetch data again after a minute makes a fresh request.")
         st.stop()
-    if not prof or not inc:
+    if not inc:
         st.warning(f"No data returned for '{sym}'. Check the ticker (NSE: .NS, BSE: .BO) or wait a minute and retry.")
         st.stop()
 
