@@ -296,6 +296,42 @@ def _price_history(symbol, key=None, years=5):
     return sr
 
 
+@st.cache_data(show_spinner=False)
+def _nse_universe():
+    """~220 large NSE companies: ticker -> [Yahoo industry, sector, market cap ₹ crore, name] (snapshot, Nov 2026)."""
+    import json, os
+    try:
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "nse_peers.json"), encoding="utf-8") as f_:
+            return json.load(f_)
+    except Exception:
+        return {}
+
+
+def suggest_peers(symbol, industry=None, sector=None, n=4):
+    """Peers = largest companies in the same industry; fill from the same sector; then Yahoo's similar-stocks list."""
+    U = _nse_universe()
+    base = symbol.split(".")[0] + ".NS"
+    if base in U:
+        industry, sector = U[base][0], U[base][1]
+    same_ind = sorted([s_ for s_, v in U.items() if v[0] == industry and s_ != base], key=lambda s_: -U[s_][2])
+    picks, how = same_ind[:n], f"Same industry ({industry}), largest by market cap."
+    if len(picks) < n and sector:
+        more = sorted([s_ for s_, v in U.items() if v[1] == sector and s_ != base and s_ not in picks], key=lambda s_: -U[s_][2])
+        if more:
+            how = (f"Same industry ({industry}) first, then the largest companies in the {sector} sector." if picks
+                   else f"No listed peer in {industry}; largest companies in the {sector} sector.")
+        picks += more[:n - len(picks)]
+    if not picks:
+        try:
+            r_ = yf.Ticker(symbol)._data.get_raw_json(
+                f"https://query2.finance.yahoo.com/v6/finance/recommendationsbysymbol/{symbol}")
+            picks = [x["symbol"] for x in r_["finance"]["result"][0]["recommendedSymbols"] if x["symbol"].endswith(".NS")][:n]
+            how = "Yahoo Finance 'similar stocks' list (industry not matched)."
+        except Exception:
+            picks, how = [], ""
+    return picks, how
+
+
 def pick(d, *names):
     for n in names:
         if isinstance(d, dict) and d.get(n) is not None:
@@ -625,10 +661,19 @@ else:
         st.caption("Compare the company with up to 4 peers on TTM (trailing twelve months) ratios.")
         PEERS = st.session_state.get("peers") if st.session_state.get("peers_for") == sym else None
         if st.session_state.get("peer_sug_for") != sym:
-            st.session_state.peer_sug_for, st.session_state.peer_text = sym, ""
-        a = st
+            st.session_state.peer_sug_for, st.session_state.peer_text, st.session_state.peer_how = sym, "", ""
+        def _suggest_peers():
+            sug, how = suggest_peers(sym, p.get("industry"), p.get("sector"))
+            st.session_state.peer_text = ", ".join(x.replace(".NS", "") for x in sug)
+            st.session_state.peer_how = how
+        a, b = st.columns([3, 1])
         peer_text = a.text_input("Peer tickers (NSE, comma-separated)", key="peer_text",
                                  placeholder="e.g. INFY, WIPRO, HCLTECH, TECHM")
+        b.markdown("<div style='height:28px'></div>", unsafe_allow_html=True)
+        b.button("Suggest Indian peers", key="peer_sug", on_click=_suggest_peers, width="stretch",
+                 help="Largest NSE companies in the same Yahoo industry (then same sector).")
+        if st.session_state.get("peer_how") and st.session_state.get("peer_sug_for") == sym and st.session_state.get("peer_text"):
+            st.caption(st.session_state.peer_how + " Edit the list if you prefer other peers.")
         if st.button("Load peer comparison", key="peer_btn"):
             tick = [sym] + [(x.strip().upper() if "." in x else x.strip().upper() + ".NS") for x in peer_text.split(",")
                             if x.strip()][:4]
@@ -666,7 +711,7 @@ else:
             st.dataframe(view, width="stretch")
             st.caption("Trailing-twelve-month ratios from Yahoo Finance. Type NSE symbols; .NS is added automatically.")
         else:
-            st.html(card(t("Type up to 4 peer tickers from the same sector (e.g. for TCS: INFY, WIPRO, HCLTECH, TECHM), then <b>Load peer comparison</b>.", TXT, 14)))
+            st.html(card(t("Click <b>Suggest Indian peers</b> or type up to 4 NSE tickers from the same sector (e.g. for TCS: INFY, WIPRO, HCLTECH, TECHM), then <b>Load peer comparison</b>.", TXT, 14)))
 
     # ---------------- cost of capital ----------------
     with tabs[5]:
